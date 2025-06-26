@@ -1098,7 +1098,8 @@ fl non_cache::eval      (const model& m, fl v) const { // clean up
 1. 初始化搜索参数
 2. 调用`parallel_mc(const model& m, output_container& out, const precalculate_byatom& p, const igrid& ig, const vec& corner1, const vec& corner2, rng& generator, std::function<void(double)>* progress_callback) const`，这是一个`()`运算符的重载。得到输出构象
 3. 去除冗余构象
-4. 计算各个构象的结合能，并计算分数，按照分数排序输出
+4. 如果设置了精细化，则要再用`non_cache`对所有构象再进行精细化的计算
+5. 计算各个构象的结合能，并计算分数，按照分数排序输出
 
 ## 并行框架
 
@@ -1295,7 +1296,7 @@ private:
 
 ---
 
-## 全局搜索
+## monte-carlo
 
 1. 随机初始化构象，设置局部优化器的搜索步数
 2. 全局搜索迭代：
@@ -1350,6 +1351,7 @@ void monte_carlo::operator()(model& m, output_container& out, const precalculate
 
 1. 提供扭转角的操作函数：置0、随机生成、按比例增量更新、检查是否过于接近等
 2. 定义构象与构象的变化，包括刚体、配体和柔性残基
+3. 实际上构象就是BFGS中的自变量；构象变化就是梯度
 #### 刚体
 
 在刚体变化量中，刚体朝向的变化量选择使用了三元组；而在刚体构象中，选择使用了四元数。
@@ -1460,16 +1462,17 @@ struct output_type {
 };
 ```
 ## 局部优化器
-
 ### quasi_newton
 
+- 封装局部优化最大步数；`average_required_improvement`目前无作用
+- 提供`quasi_newton_aux`用于计算能量及导数
+- bfgs算法的入口
 ```cpp
 struct quasi_newton {
     unsigned max_steps;
     fl average_required_improvement;
     quasi_newton() : max_steps(1000), average_required_improvement(0.0) {}
-    // clean up
-    void operator()(model& m, const precalculate_byatom& p, const igrid& ig, output_type& out, change& g, const vec& v, int& evalcount) const; // g must have correct size
+    void operator()(model& m, const precalculate_byatom& p, const igrid& ig, output_type& out, change& g, const vec& v, int& evalcount) const;
 };
 
 struct quasi_newton_aux {
@@ -1499,13 +1502,246 @@ void quasi_newton::operator()(model& m, const precalculate_byatom& p, const igri
 }
 ```
 
+### 能量计算
+
+1. 计算配体与受体网格的相互作用
+2. 计算每个配体内部的相互作用
+3. 计算不同配体之间、配体和柔性残基之间的相互作用
+4. 计算柔性残基之间的相互作用
+5. 计算胶合原子相互作用
+6. 计算配体和柔性残基的导数
+7. 根据计算中得到的相互作用力，计算配体和柔性残基所受到的力和力矩，它们分别作为新的梯度`g`的能量关于位置的梯度和能量关于朝向的梯度（配体）；或者用力矩在轴方向的投影代表能量关于扭转角的梯度
+
+```cpp
+fl model::eval_deriv(const precalculate_byatom& p, const igrid& ig, const vec& v, change& g) { // clean up
+    // INTER ligand - grid (配体与网格的相互作用)
+    fl e = ig.eval_deriv(*this, v[1]); // sets minus_forces, except inflex
+
+    // INTRA ligand_i - ligand_i (配体内部相互作用)
+    VINA_FOR_IN(i, ligands)
+        e += eval_interacting_pairs_deriv(p, v[0], ligands[i].pairs, coords, minus_forces); // adds to minus_forces
+
+    // INTER ligand_i - ligand_j and ligand_i - flex_i (配体间及配体-柔性相互作用)
+    if (!inter_pairs.empty()) 
+        e += eval_interacting_pairs_deriv(p, v[2], inter_pairs, coords, minus_forces); // adds to minus_forces
+    // INTRA flex_i - flex_i and flex_i - flex_j (柔性部分内部及柔性部分间相互作用)
+    if (!other_pairs.empty())
+        e += eval_interacting_pairs_deriv(p, v[2], other_pairs, coords, minus_forces); // adds to minus_forces
+    // glue_i - glue_i and glue_i - glue_j (胶合原子相互作用，用于大环闭合)
+    if (!glue_pairs.empty())
+        e += eval_interacting_pairs_deriv(p, v[2], glue_pairs, coords, minus_forces, true); // adds to minus_forces
+
+    // calculate derivatives (计算最终的导数)
+    ligands.derivative(coords, minus_forces, g.ligands);  // 计算配体的导数
+    flex.derivative(coords, minus_forces, g.flex); // inflex forces are ignored，计算柔性部分的导数
+    return e;
+}
+```
+
+#### 相互作用对能量计算
+
+对于截断距离内的原子对，用预计算`p`快速插值得到它们之间的相互作用能量以及相互作用力；累计相互作用能量，并将其添加到`model::minus_forces`中，后续用作计算梯度
+
+```cpp
+fl eval_interacting_pairs_deriv(const precalculate_byatom& p, fl v, const interacting_pairs& pairs, const vecv& coords, vecv& forces, const bool with_max_cutoff) { // adds to forces  // clean up
+    fl e = 0;
+    fl cutoff_sqr = p.cutoff_sqr();
+    if (with_max_cutoff) {
+		cutoff_sqr = p.max_cutoff_sqr();
+	}
+
+	VINA_FOR_IN(i, pairs) {
+        const interacting_pair& ip = pairs[i];
+        vec r = coords[ip.b] - coords[ip.a];
+        fl r2 = sqr(r);
+        
+        if(r2 < cutoff_sqr) {  // 只处理在截断距离内的原子对
+            // tmp.first是能量，tmp.second是(dE/dr²)/r
+            pr tmp = p.eval_deriv(ip.a, ip.b, r2);  
+
+            // 计算作用力向量：F = -dE/dr = -(dE/dr²)/r * r = tmp.second * r
+			vec force;
+            force = tmp.second * r;
+            
+            curl(tmp.first, force, v);  // 对能量和力应用平滑截断
+            e += tmp.first;
+
+            // 根据牛顿第三定律分配力：
+            forces[ip.a] -= force;
+            forces[ip.b] += force;
+		}
+	}
+	return e;
+}
+```
+
+#### 导数计算
+
+计算配体/柔性残基所受的合力以及合力矩。以配体的计算为例`heterotree::derivative`：
+1. 计算根节点（解析时选定的第一个原子）所受力和力矩的总和
+2. 递归计算所有分支
+3. 计算得到配体所受的合力以及合力矩后，设置梯度：位置使用合力（能量对位置的梯度）、朝向使用合力矩（能量对朝向的梯度）
+```cpp
+void derivative(const vecv& coords, const vecv& forces, ligand_change& c) const {
+	vecp force_torque = node.sum_force_and_torque(coords, forces);
+	flv::iterator p = c.torsions.begin();
+	branches_derivative(children, node.get_origin(), coords, forces, force_torque, p);
+	node.set_derivative(force_torque, c.rigid);
+	assert(p == c.torsions.end());
+}
+	
+template<typename T> // T == branch
+void branches_derivative(const std::vector<T>& b, const vec& origin, const vecv& coords, const vecv& forces, vecp& out, flv::iterator& d) { // adds to out
+	VINA_FOR_IN(i, b) {
+		vecp force_torque = b[i].derivative(coords, forces, d);
+		out.first  += force_torque.first;
+		vec r; r = b[i].node.get_origin() - origin;
+		out.second += cross_product(r, force_torque.first) + force_torque.second;
+	}
+}
+void set_derivative(const vecp& force_torque, rigid_change& c) const {
+	c.position     = force_torque.first;
+	c.orientation  = force_torque.second;
+}
+```
+
 
 ### bfgs
 
-1. 初始化Hessian矩阵近似为单位矩阵；复制初始构象和梯度；存档原始状态
-2. 计算搜索方向 p = -H * g
-3. 线搜索确定步长
-4. 更新位置和梯度
-5. 更新Hessian逆矩阵近似
-6. 检查收敛条件
+牛顿法的核心思想是利用目标函数在当前点的二阶泰勒展开来近似，然后求解这个二次模型的极小值点作为下一步的迭代方向。标准的牛顿法需要计算并求解目标函数的二阶导数矩阵——**Hessian矩阵**的逆，这在很多实际问题（尤其是高维问题，如分子对接）中计算量巨大，甚至Hessian矩阵是不可逆的。
 
+拟牛顿法的巧妙之处在于，它**不直接计算Hessian矩阵及其逆矩阵**，而是通过在迭代过程中观测函数值和梯度的变化，构造一个对Hessian矩阵的逆的近似矩阵。BFGS就是其中最成功的一种近似更新策略。
+#### 迭代公式
+
+ 算法从一个初始点$x_0$ 开始，通过以下迭代公式产生一系列点，直至收敛到局部最小值：$x_{k+1}​=x_k​+\alpha_k​p_k​=x_k-B_kg_k\alpha_k$。其中：
+ - $x_k$ ​是第$k$次迭代的位置，也就是构象
+ - $p_k$​ 是第$k$次迭代的**搜索方向**，由梯度和Hessian矩阵的逆的近似矩阵$B_k$决定，$p_k=-B_kg_k$
+ - $\alpha_k$ 是第$k$次迭代的**步长**，通过线性搜索 (line search) 得到
+##### 线性搜索
+这一步是在确定了下降方向$p_k$后，需要选择一个合适的步长$\alpha_k$让函数值由实质性的下降。为此，要满足**Armijo**条件：
+$$
+f(x_k+\alpha p_k)\le f(x_k) + c_1\alpha g p_k
+$$
+```cpp
+template<typename F, typename Conf, typename Change>
+fl line_search(F& f, sz n, const Conf& x, const Change& g, const fl f0, const Change& p, Conf& x_new, Change& g_new, fl& f1, int& evalcount) { // returns alpha
+	const fl c0 = 0.0001;
+	const unsigned max_trials = 10;
+	const fl multiplier = 0.5;
+	fl alpha = 1;
+
+	const fl pg = scalar_product(p, g, n);
+
+	VINA_U_FOR(trial, max_trials) {
+		// 计算f(x_k + alpha * p_k)
+		x_new = x; x_new.increment(p, alpha);
+		f1 = f(x_new, g_new);
+		evalcount++;
+		// 判断是否满足Armijo条件
+		if(f1 - f0 < c0 * alpha * pg) // FIXME check - div by norm(p) ? no?
+			break;
+		alpha *= multiplier;
+	}
+	return alpha;
+}
+```
+##### Hessian近似矩阵更新
+在完成一步迭代，从$x_k$移动到$x_{k+1}$​后，我们需要更新近似矩阵，从$B_k$​得到$B_{k+1}$​。
+
+首先定义两个向量：
+- 位置变化量: $s_k​=x_{k+1}​−x_k​=α_k​p_k$​  
+- 梯度变化量: $y_k​=g_{k+1}​−g_k​$  
+
+BFGS更新公式如下：
+$$
+B_{k+1}​=(I−\frac{​s_k​y_k^T}{y_k^T​s_k}​​)B_k​(I−\frac{y_k​s_k^T}{y_k^T​s_k​}​​)+\frac{s_k​s_k^T}{​y_k^T​s_k}​​
+$$
+```cpp
+template<typename Change>
+inline bool bfgs_update(flmat& h, const Change& p, const Change& y, const fl alpha) {
+	const fl yp  = scalar_product(y, p, h.dim());
+	if(alpha * yp < epsilon_fl) return false; // FIXME?
+	Change minus_hy(y); minus_mat_vec_product(h, y, minus_hy);
+	const fl yhy = - scalar_product(y, minus_hy, h.dim());
+	const fl r = 1 / (alpha * yp); // 1 / (s^T * y) , where s = alpha * p // FIXME   ... < epsilon
+	const sz n = p.num_floats();
+	VINA_FOR(i, n)
+		VINA_RANGE(j, i, n) // includes i
+			h(i, j) +=   alpha * r * (minus_hy(i) * p(j)
+	                                + minus_hy(j) * p(i)) +
+			           + alpha * alpha * (r*r * yhy  + r) * p(i) * p(j); // s * s == alpha * alpha * p * p
+	return true;
+}
+```
+#### AutoDock Vina中的bfgs实现
+
+现在，我们将上述理论与您提供的C++代码对应，分析Vina是如何实现BFGS算法来优化分子构象的：
+- **目标函数** $f(x)$：是Vina的**打分函数**，用于评估特定构象下的配体-受体结合自由能；由`quasi_newton_aux::operator()(const conf& c, change& g)`提供
+- **变量** $x$：是描述配体和柔性残基构象的向量，包括配体的平移、旋转以及所有可旋转键的扭转角
+- **梯度** $g$：是打分函数对构象变量的梯度，Vina能够解析地计算这个梯度，这是其高效优化的关键
+
+```cpp
+template<typename F, typename Conf, typename Change>
+fl bfgs(F& f, Conf& x, Change& g, const unsigned max_steps, const fl average_required_improvement, const sz over,
+		int& evalcount) { // x is I/O, final value is returned
+	sz n = g.num_floats();
+	// 初始化Hessian矩阵的逆矩阵近似为单位矩阵
+	flmat h(n, 0);
+	set_diagonal(h, 1);
+
+	// 复制初始梯度和构象
+	Change g_new(g);
+	Conf x_new(x);
+	fl f0 = f(x, g);
+	evalcount++;
+
+	// 原始状态存档
+	fl f_orig = f0;
+	Change g_orig(g);
+	Conf x_orig(x);
+
+	Change p(g);	// 搜索方向，用梯度初始化
+
+	// 结合能历史记录，似乎只记录但是没有使用
+	flv f_values; f_values.reserve(max_steps+1);
+	f_values.push_back(f0);
+
+	VINA_U_FOR(step, max_steps) {
+		// 计算搜索方向  p = -H * g
+		minus_mat_vec_product(h, g, p);
+
+		// 线性搜索确定最优步长，并更新构象x_new
+		fl f1 = 0;
+		const fl alpha = line_search(f, n, x, g, f0, p, x_new, g_new, f1, evalcount);
+
+		// 计算梯度变化，y=g_new - g
+		Change y(g_new); subtract_change(y, g, n);
+
+		// 更新能量与构象
+		f_values.push_back(f1);
+		f0 = f1;
+		x = x_new;
+
+		// 检查收敛条件，若满足要求则说明到达一个梯度很小的平稳点（很可能就是局部极小值点），迭代终止
+		if(!(std::sqrt(scalar_product(g, g, n)) >= 1e-5)) break; // breaks for nans too // FIXME !!?? 
+		g = g_new; // ?
+
+		// 启发式的初始化Hessian矩阵的策略，仅在第一次迭代时应用
+		if(step == 0) {
+			const fl yy = scalar_product(y, y, n);
+			if(std::abs(yy) > epsilon_fl)
+				set_diagonal(h, alpha * scalar_product(y, p, n) / yy);
+		}
+
+		// 更新Hessian逆矩阵近似
+		bool h_updated = bfgs_update(h, p, y, alpha);
+	}
+	// 如果优化失败（函数值增加或出现NaN），恢复到原始状态
+	if(!(f0 <= f_orig)) { // succeeds for nans too
+		f0 = f_orig;
+		x = x_orig;
+		g = g_orig;
+	}
+	return f0;
+}
+```
